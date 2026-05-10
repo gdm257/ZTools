@@ -1,4 +1,5 @@
 import { exec, spawn } from 'child_process'
+import os from 'os'
 import type { PluginManager } from '../../managers/pluginManager'
 import { BrowserWindow, clipboard, nativeImage, Notification, shell } from 'electron'
 import { promisify } from 'util'
@@ -15,54 +16,76 @@ interface SystemCommandContext {
   pluginManager: PluginManager | null
 }
 
-function openWindowsCmd(folderPath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    let settled = false
-    let timeout: ReturnType<typeof setTimeout> | null = null
+function getSingleFilePathParam(param: any): string | undefined {
+  if (param?.type !== 'files' || !Array.isArray(param.payload) || param.payload.length !== 1) {
+    return undefined
+  }
 
-    const settle = (error?: unknown): void => {
-      if (settled) return
-      settled = true
-      if (timeout) {
-        clearTimeout(timeout)
-        timeout = null
-      }
+  return typeof param.payload[0]?.path === 'string' ? param.payload[0].path : undefined
+}
 
-      if (error) {
-        reject(error)
-        return
-      }
-      resolve()
-    }
+/**
+ * Windows 窗口信息类型
+ */
+interface WindowsWindowInfo {
+  hwnd?: number
+  className?: string
+}
 
-    const child = spawn('cmd.exe', ['/c', 'start', '', 'cmd.exe'], {
-      cwd: folderPath,
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true
-    })
+/**
+ * 获取 Windows 资源管理器当前文件夹路径
+ * 支持标准 Explorer 窗口（通过 COM）和桌面窗口（回退到桌面路径）
+ */
+export function getWindowsExplorerPath(windowInfo: WindowsWindowInfo): string | null {
+  return getExplorerFolderPathFromWindow(windowInfo, 'SystemCmd')
+}
 
-    timeout = setTimeout(() => settle(new Error('启动终端超时')), 3000)
-    child.once('error', settle)
-    child.once('exit', (code) => {
-      if (code && code !== 0) {
-        settle(new Error(`cmd.exe 启动终端失败，退出码: ${code}`))
-        return
+/**
+ * 尝试启动终端（Windows 平台）
+ * 回退优先级：Windows Terminal -> PowerShell -> CMD
+ */
+/**
+ * 安全转义 PowerShell 路径参数
+ * 使用单引号包裹，将路径中的单引号替换为两个单引号
+ */
+function escapePowerShellPath(folderPath: string): string {
+  const escaped = folderPath.replace(/'/g, "''")
+  return `'${escaped}'`
+}
+
+/**
+ * 安全转义 CMD 路径参数
+ * 使用双引号包裹，将路径中的双引号转义
+ */
+function escapeCmdPath(folderPath: string): string {
+  // CMD 中双引号内的双引号需要用 ^ 转义
+  const escaped = folderPath.replace(/"/g, '^"')
+  return `"${escaped}"`
+}
+
+export async function tryLaunchWindowsTerminal(folderPath: string): Promise<boolean> {
+  const tryLaunch = (cmd: string, args: string[]): Promise<boolean> => {
+    return new Promise<boolean>((resolve) => {
+      const child = spawn(cmd, args, { detached: true, stdio: 'ignore' })
+      child.on('error', () => resolve(false))
+      if (child.pid) {
+        child.unref()
+        resolve(true)
       }
-      settle()
     })
-    child.once('close', (code) => {
-      if (code && code !== 0) {
-        settle(new Error(`cmd.exe 启动终端失败，退出码: ${code}`))
-        return
-      }
-      settle()
-    })
-    child.once('spawn', () => {
-      child.unref()
-      settle()
-    })
-  })
+  }
+
+  // Windows Terminal 使用 spawn 参数数组，天然安全
+  // PowerShell 和 CMD 需要转义路径以防止命令注入
+  return (
+    (await tryLaunch('wt.exe', ['-d', folderPath])) ||
+    (await tryLaunch('powershell.exe', [
+      '-NoExit',
+      '-Command',
+      `Set-Location -Path ${escapePowerShellPath(folderPath)}`
+    ])) ||
+    (await tryLaunch('cmd.exe', ['/K', `cd /d ${escapeCmdPath(folderPath)}`]))
+  )
 }
 
 /**
@@ -432,7 +455,16 @@ async function handleCopyPath(
   execAsync: (cmd: string) => Promise<{ stdout: string; stderr: string }>,
   param?: any
 ): Promise<any> {
-  console.log('[SystemCmd] 执行复制路径')
+  const filePath = getSingleFilePathParam(param)
+  console.log('[SystemCmd] 执行复制路径', filePath ? `(剪贴板文件: ${filePath})` : '(从窗口获取)')
+
+  if (filePath) {
+    clipboard.writeText(filePath)
+    console.log('[SystemCmd] 已复制路径:', filePath)
+    ctx.mainWindow?.hide()
+    return { success: true, path: filePath }
+  }
+
   const windowInfo =
     (param?.type === 'window' && param?.payload) || windowManager.getPreviousActiveWindow()
 
@@ -441,10 +473,7 @@ async function handleCopyPath(
   }
 
   if (process.platform === 'win32') {
-    const folderPath =
-      windowInfo.app === 'explorer.exe'
-        ? getExplorerFolderPathFromWindow(windowInfo, 'SystemCmd')
-        : null
+    const folderPath = getWindowsExplorerPath(windowInfo as WindowsWindowInfo)
     if (!folderPath) {
       return { success: false, error: '未读取到当前 "文件资源管理器" 窗口目录' }
     }
@@ -480,106 +509,133 @@ async function handleCopyPath(
   return { success: false, error: `不支持的平台: ${process.platform}` }
 }
 
+/**
+ * 在 macOS 上打开终端并切换到指定目录
+ */
+async function openTerminalOnMac(
+  folderPath: string,
+  execAsync: (cmd: string) => Promise<{ stdout: string; stderr: string }>
+): Promise<void> {
+  const script = `
+    tell application "Terminal"
+      activate
+      do script "cd " & quoted form of "${folderPath}"
+    end tell
+  `
+  await execAsync(`osascript -e '${script}'`)
+}
+
+/**
+ * 在 Linux 上尝试启动终端并切换到指定目录
+ * 回退优先级：exo-open -> gnome-terminal -> xterm
+ */
+async function openTerminalOnLinux(folderPath: string): Promise<boolean> {
+  const tryLaunch = (cmd: string, args: string[]): Promise<boolean> => {
+    return new Promise<boolean>((resolve) => {
+      const child = spawn(cmd, args, { detached: true, stdio: 'ignore' })
+      child.on('error', () => resolve(false))
+      if (child.pid) {
+        child.unref()
+        resolve(true)
+      }
+    })
+  }
+
+  return (
+    (await tryLaunch('exo-open', [
+      '--launch',
+      'TerminalEmulator',
+      '--working-directory',
+      folderPath
+    ])) ||
+    (await tryLaunch('gnome-terminal', [`--working-directory=${folderPath}`])) ||
+    (await tryLaunch('xterm', ['-cd', folderPath]))
+  )
+}
+
+/**
+ * 从窗口信息获取 macOS 访达当前目录路径
+ */
+async function getMacFinderPath(
+  execAsync: (cmd: string) => Promise<{ stdout: string; stderr: string }>
+): Promise<string> {
+  const script = `
+    tell application "Finder"
+      if (count of Finder windows) is 0 then
+        return POSIX path of (desktop as alias)
+      else
+        return POSIX path of (target of front window as alias)
+      end if
+    end tell
+  `
+  const { stdout } = await execAsync(`osascript -e '${script}'`)
+  return stdout.trim()
+}
+
 async function handleOpenTerminal(
   ctx: SystemCommandContext,
   execAsync: (cmd: string) => Promise<{ stdout: string; stderr: string }>,
   param?: any
 ): Promise<any> {
-  console.log('[SystemCmd] 执行在终端打开')
-  const windowInfo =
-    (param?.type === 'window' && param?.payload) || windowManager.getPreviousActiveWindow()
+  const folderPath = getSingleFilePathParam(param)
+  console.log(
+    '[SystemCmd] 执行在终端打开',
+    folderPath ? `(剪贴板文件夹: ${folderPath})` : '(从窗口获取)'
+  )
 
-  if (!windowInfo) {
-    return { success: false, error: '无法获取当前窗口信息' }
-  }
+  try {
+    let targetPath: string | null = folderPath ?? null
 
-  if (process.platform === 'win32') {
-    try {
-      const folderPath =
-        windowInfo.app === 'explorer.exe'
-          ? getExplorerFolderPathFromWindow(windowInfo, 'SystemCmd')
-          : null
-      if (!folderPath) {
-        return { success: false, error: '未读取到当前 "文件资源管理器" 窗口目录' }
+    // 如果没有提供路径，从窗口获取
+    if (!targetPath) {
+      const windowInfo =
+        (param?.type === 'window' && param?.payload) || windowManager.getPreviousActiveWindow()
+      if (!windowInfo) {
+        return { success: false, error: '无法获取当前窗口信息' }
       }
 
-      await openWindowsCmd(folderPath)
-      console.log('[SystemCmd] 已在终端打开:', folderPath)
-      ctx.mainWindow?.webContents.send('app-launched')
-      ctx.mainWindow?.hide()
-      return { success: true, path: folderPath }
-    } catch (error) {
-      console.error('[SystemCmd] 在终端打开失败:', error)
-      return { success: false, error: String(error) }
-    }
-  }
-
-  if (process.platform === 'darwin') {
-    try {
-      const script = `
-      tell application "Finder"
-        if (count of Finder windows) is 0 then
-          set folderPath to POSIX path of (desktop as alias)
-        else
-          set folderPath to POSIX path of (target of front window as alias)
-        end if
-      end tell
-
-      tell application "Terminal"
-        activate
-        do script "cd " & quoted form of folderPath
-      end tell
-    `
-      await execAsync(`osascript -e '${script}'`)
-      console.log('[SystemCmd] 已在终端打开')
-      ctx.mainWindow?.hide()
-      return { success: true }
-    } catch (error) {
-      console.error('[SystemCmd] 在终端打开失败:', error)
-      return { success: false, error: String(error) }
-    }
-  } else if (process.platform === 'linux') {
-    try {
-      // 获取当前用户主目录作为默认路径
-      const folderPath = require('os').homedir()
-
-      // 依次尝试常用的终端启动方式，由于 spawn 不会像 exec 那样容易受到注入攻击
-      // 我们通过尝试启动不同的进程来实现兼容性
-      const tryLaunch = (cmd: string, args: string[]) => {
-        return new Promise<boolean>((resolve) => {
-          const child = spawn(cmd, args, { detached: true, stdio: 'ignore' })
-          child.on('error', () => resolve(false))
-          // 只要进程成功启动（没有立即触发 error 且 pid 存在），就认为成功
-          if (child.pid) {
-            child.unref()
-            resolve(true)
-          }
-        })
+      if (process.platform === 'darwin') {
+        targetPath = await getMacFinderPath(execAsync)
+      } else if (process.platform === 'win32') {
+        targetPath = getWindowsExplorerPath(windowInfo as WindowsWindowInfo)
+        if (!targetPath) {
+          return { success: false, error: '无法获取资源管理器路径' }
+        }
+      } else if (process.platform === 'linux') {
+        // linux获取当前目录路径的方式待定，先写home目录
+        targetPath = os.homedir()
       }
+    }
 
-      const launched =
-        (await tryLaunch('exo-open', [
-          '--launch',
-          'TerminalEmulator',
-          '--working-directory',
-          folderPath
-        ])) ||
-        (await tryLaunch('gnome-terminal', [`--working-directory=${folderPath}`])) ||
-        (await tryLaunch('xterm', ['-cd', folderPath]))
+    if (!targetPath) {
+      return { success: false, error: '无法确定目标路径' }
+    }
 
+    // 根据平台打开终端
+    if (process.platform === 'darwin') {
+      await openTerminalOnMac(targetPath, execAsync)
+    } else if (process.platform === 'linux') {
+      const launched = await openTerminalOnLinux(targetPath)
       if (!launched) {
         throw new Error('Could not find a supported terminal emulator')
       }
-
-      console.log('[SystemCmd] 已在终端打开')
-      ctx.mainWindow?.hide()
-      return { success: true }
-    } catch (error) {
-      console.error('[SystemCmd] 在终端打开失败:', error)
-      return { success: false, error: String(error) }
+    } else if (process.platform === 'win32') {
+      const launched = await tryLaunchWindowsTerminal(targetPath)
+      if (!launched) {
+        return { success: false, error: '无法启动终端' }
+      }
+    } else {
+      return { success: false, error: `不支持的平台: ${process.platform}` }
     }
+
+    console.log('[SystemCmd] 已在终端打开:', targetPath)
+    ctx.mainWindow?.webContents.send('app-launched')
+    ctx.mainWindow?.hide()
+    return { success: true }
+  } catch (error) {
+    console.error('[SystemCmd] 在终端打开失败:', error)
+    return { success: false, error: String(error) }
   }
-  return { success: false, error: `不支持的平台: ${process.platform}` }
 }
 
 async function handleOpenFolder(ctx: SystemCommandContext, param: any): Promise<any> {
