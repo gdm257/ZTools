@@ -115,12 +115,20 @@ const lazyPluginDetach = lazyListen('plugin-detach', () => {
 })
 
 // mainPush 查询请求（由 onMainPush 触发注册，搜索时主进程转发）
-const lazyMainPushQuery = lazyListen('main-push-query', (event, { queryData, callId }) => {
+const lazyMainPushQuery = lazyListen('main-push-query', async (event, { queryData, callId }) => {
   try {
     let allResults = []
     if (mainPushCallback) {
       try {
-        const results = mainPushCallback.callback(queryData)
+        let results = mainPushCallback.callback(queryData)
+        // MainPush结果可能是一个 Promise，需要等待结果
+        if (results && typeof results.then === 'function') {
+          results = await results
+        }
+        // MainPush结果可能是一个对象，需要提取 data 字段
+        if (results && Array.isArray(results.data)) {
+          results = results.data
+        }
         if (Array.isArray(results) && results.length > 0) {
           allResults = allResults.concat(results)
         }
