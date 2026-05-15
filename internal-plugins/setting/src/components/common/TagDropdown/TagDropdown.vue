@@ -2,7 +2,7 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import type { TagDropdownMenuEmits, TagDropdownMenuProps, TagDropdownMenuItem } from '@/components'
 
-defineProps<TagDropdownMenuProps>()
+const props = defineProps<TagDropdownMenuProps>()
 
 const emit = defineEmits<TagDropdownMenuEmits>()
 
@@ -20,7 +20,7 @@ function updateMenuPosition(): void {
   const viewportWidth = window.innerWidth
   const viewportHeight = window.innerHeight
   const menuWidth = 160 // 预估菜单宽度
-  const menuHeight = 120 // 预估菜单高度
+  const menuHeight = props.menuItems.length * 36 // 预估菜单高度
   const gap = 4
 
   // 水平位置：默认左对齐，右侧不够则右对齐
