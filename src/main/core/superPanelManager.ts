@@ -9,6 +9,7 @@ import windowManager from '../managers/windowManager.js'
 import clipboardManager, { type LastCopiedContent } from '../managers/clipboardManager.js'
 import { applyWindowMaterial, getDefaultWindowMaterial } from '../utils/windowUtils.js'
 import translationManager from './translationManager.js'
+import { filterSuperPanelPinnedCommands } from './superPanelPinnedCommands.js'
 
 // 超级面板窗口尺寸
 const SUPER_PANEL_WIDTH = 250
@@ -671,37 +672,10 @@ class SuperPanelManager {
         }
 
         // 递归处理文件夹内部的指令
-        pinnedCommands = pinnedCommands
-          .map((cmd: any) => {
-            if (cmd.isFolder) {
-              cmd.items = cmd.items.filter((item: any) => {
-                if (featureCode) {
-                  return !(item.path === path && item.featureCode === featureCode)
-                }
-                return item.path !== path
-              })
-              return cmd
-            }
-            return cmd
-          })
-          .filter((cmd: any) => {
-            if (cmd.isFolder) {
-              // 文件夹为空则移除，只剩1个则展开
-              return cmd.items.length > 0
-            }
-            if (featureCode) {
-              return !(cmd.path === path && cmd.featureCode === featureCode)
-            }
-            return cmd.path !== path
-          })
-
-        // 文件夹只剩1个指令时自动解散
-        pinnedCommands = pinnedCommands.flatMap((cmd: any) => {
-          if (cmd.isFolder && cmd.items.length === 1) {
-            return cmd.items
-          }
-          return [cmd]
-        })
+        pinnedCommands = filterSuperPanelPinnedCommands(pinnedCommands, {
+          path,
+          featureCode
+        }).items
 
         console.log('[SuperPanel] 更新后的固定列表:', pinnedCommands.length, '项')
         databaseAPI.dbPut('super-panel-pinned', pinnedCommands)

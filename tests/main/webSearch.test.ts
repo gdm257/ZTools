@@ -176,6 +176,96 @@ describe('webSearchAPI', () => {
     ])
   })
 
+  it('removes deleted webpage commands from history, pins, stats, and super panel pins', async () => {
+    const send = vi.fn()
+    mockGetMainWindow.mockReturnValue({ webContents: { send } })
+    mockDbGet.mockImplementation((key: string) => {
+      if (key === 'web-search-engines') {
+        return [
+          {
+            id: 'webpage-1',
+            name: 'Example',
+            url: 'https://example.com/',
+            icon: '',
+            enabled: true,
+            type: 'webpage',
+            keyword: 'example'
+          },
+          {
+            id: 'webpage-2',
+            name: 'Keep',
+            url: 'https://keep.example.com/',
+            icon: '',
+            enabled: true,
+            type: 'webpage',
+            keyword: 'keep'
+          }
+        ]
+      }
+      if (key === 'command-history') {
+        return [
+          { path: '/system', type: 'plugin', featureCode: 'web-search-webpage-1' },
+          { path: '/system', type: 'plugin', featureCode: 'web-search-webpage-2' }
+        ]
+      }
+      if (key === 'pinned-commands') {
+        return [
+          { path: '/system', type: 'plugin', featureCode: 'web-search-webpage-1' },
+          { path: '/system', type: 'plugin', featureCode: 'web-search-webpage-2' }
+        ]
+      }
+      if (key === 'command-usage-stats') {
+        return [
+          { path: '/system', type: 'plugin', featureCode: 'web-search-webpage-1' },
+          { path: '/system', type: 'plugin', featureCode: 'web-search-webpage-2' }
+        ]
+      }
+      if (key === 'super-panel-pinned') {
+        return [
+          {
+            isFolder: true,
+            name: 'Folder',
+            items: [
+              { path: '/system', type: 'plugin', featureCode: 'web-search-webpage-1' },
+              { path: '/system', type: 'plugin', featureCode: 'web-search-webpage-2' }
+            ]
+          }
+        ]
+      }
+      return []
+    })
+
+    await expect(webSearchAPI.deleteEngine('webpage-1')).resolves.toEqual({ success: true })
+
+    expect(mockDbPut).toHaveBeenCalledWith('web-search-engines', [
+      {
+        id: 'webpage-2',
+        name: 'Keep',
+        url: 'https://keep.example.com/',
+        icon: '',
+        enabled: true,
+        type: 'webpage',
+        keyword: 'keep'
+      }
+    ])
+    expect(mockDbPut).toHaveBeenCalledWith('command-history', [
+      { path: '/system', type: 'plugin', featureCode: 'web-search-webpage-2' }
+    ])
+    expect(mockDbPut).toHaveBeenCalledWith('pinned-commands', [
+      { path: '/system', type: 'plugin', featureCode: 'web-search-webpage-2' }
+    ])
+    expect(mockDbPut).toHaveBeenCalledWith('command-usage-stats', [
+      { path: '/system', type: 'plugin', featureCode: 'web-search-webpage-2' }
+    ])
+    expect(mockDbPut).toHaveBeenCalledWith('super-panel-pinned', [
+      { path: '/system', type: 'plugin', featureCode: 'web-search-webpage-2' }
+    ])
+    expect(send).toHaveBeenCalledWith('history-changed')
+    expect(send).toHaveBeenCalledWith('pinned-changed')
+    expect(send).toHaveBeenCalledWith('super-panel-pinned-changed')
+    expect(send).toHaveBeenCalledWith('plugins-changed')
+  })
+
   it('falls back to favicon.ico when the page html response fails to decode', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     mockNetRequest.mockImplementation((url: string) => {

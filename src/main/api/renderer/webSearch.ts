@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto'
 import windowManager from '../../managers/windowManager'
 import databaseAPI from '../shared/database'
 import commandsAPI from './commands'
+import { filterSuperPanelPinnedCommands } from '../../core/superPanelPinnedCommands'
 
 export type WebSearchEngineType = 'search' | 'webpage'
 
@@ -174,12 +175,56 @@ class WebSearchAPI {
       return { success: false, error: '未找到该搜索引擎' }
     }
 
+    const featureCode = `web-search-${engines[index].id}`
+
     engines.splice(index, 1)
     databaseAPI.dbPut(this.DB_KEY, engines)
 
+    this.cleanupDeletedFeatureReferences(featureCode)
     this.notifyCommandsChanged()
 
     return { success: true }
+  }
+
+  private cleanupDeletedFeatureReferences(featureCode: string): void {
+    const cleanupTargets = [
+      { key: 'command-history', channel: 'history-changed' },
+      { key: 'pinned-commands', channel: 'pinned-changed' },
+      { key: 'command-usage-stats' },
+      { key: 'super-panel-pinned', channel: 'super-panel-pinned-changed' }
+    ]
+
+    for (const target of cleanupTargets) {
+      try {
+        const data = databaseAPI.dbGet(target.key)
+        if (!Array.isArray(data)) continue
+
+        const result =
+          target.key === 'super-panel-pinned'
+            ? filterSuperPanelPinnedCommands(data, { featureCode })
+            : this.filterDeletedFeatureFromList(data, featureCode)
+
+        if (!result.changed) continue
+
+        databaseAPI.dbPut(target.key, result.items)
+        if (target.channel) {
+          windowManager.getMainWindow()?.webContents.send(target.channel)
+        }
+      } catch (error) {
+        console.error(`[WebSearch] 清理已删除网页快开引用失败: ${target.key}`, error)
+      }
+    }
+  }
+
+  private filterDeletedFeatureFromList(
+    items: any[],
+    featureCode: string
+  ): { items: any[]; changed: boolean } {
+    const nextItems = items.filter((item) => item?.featureCode !== featureCode)
+    return {
+      items: nextItems,
+      changed: nextItems.length !== items.length
+    }
   }
 
   /**
