@@ -86,6 +86,7 @@ class WindowManager {
   // Native modal dialogs can emit queued blur/mouseup events around close.
   private modalDialogBlurHideSuppressed: boolean = false
   private modalDialogBlurHideReleaseTimer: ReturnType<typeof setTimeout> | null = null
+  private modalDialogBlurHideSuppressionDepth: number = 0
   private lastBlurHideTime: number = 0 // blur 导致隐藏窗口的时间戳（用于解决托盘点击竞态）
   private blurHideTimer: ReturnType<typeof setTimeout> | null = null // Linux blur 延迟隐藏定时器
   // Double-tap 唤醒窗口时，Windows 可能紧跟一个短暂 blur；这两个 timer 用于跳过误关闭并补一次焦点。
@@ -147,6 +148,41 @@ class WindowManager {
 
   private isBlurHideSuppressed(): boolean {
     return this.suppressBlurHide || this.modalDialogBlurHideSuppressed
+  }
+
+  private beginModalDialogBlurHideSuppression(): void {
+    if (this.modalDialogBlurHideReleaseTimer) {
+      clearTimeout(this.modalDialogBlurHideReleaseTimer)
+      this.modalDialogBlurHideReleaseTimer = null
+    }
+
+    this.modalDialogBlurHideSuppressionDepth += 1
+    this.modalDialogBlurHideSuppressed = true
+  }
+
+  private endModalDialogBlurHideSuppression(releaseDelayMs: number): void {
+    this.modalDialogBlurHideSuppressionDepth = Math.max(
+      0,
+      this.modalDialogBlurHideSuppressionDepth - 1
+    )
+    if (this.modalDialogBlurHideSuppressionDepth > 0) return
+
+    if (this.modalDialogBlurHideReleaseTimer) {
+      clearTimeout(this.modalDialogBlurHideReleaseTimer)
+    }
+
+    this.modalDialogBlurHideReleaseTimer = setTimeout(() => {
+      this.modalDialogBlurHideSuppressed = false
+      this.modalDialogBlurHideReleaseTimer = null
+    }, releaseDelayMs)
+  }
+
+  private isPromiseLike<T>(value: T | PromiseLike<T>): value is PromiseLike<T> {
+    return (
+      value !== null &&
+      (typeof value === 'object' || typeof value === 'function') &&
+      typeof (value as { then?: unknown }).then === 'function'
+    )
   }
 
   private deferBlurHideUntilMouseUp(): void {
@@ -863,21 +899,26 @@ class WindowManager {
     this.startAutoBackToSearchTimer()
   }
 
-  public withBlurHideSuppressed<T>(callback: () => T, releaseDelayMs: number = 500): T {
-    if (this.modalDialogBlurHideReleaseTimer) {
-      clearTimeout(this.modalDialogBlurHideReleaseTimer)
-      this.modalDialogBlurHideReleaseTimer = null
-    }
-
-    this.modalDialogBlurHideSuppressed = true
-
+  public withBlurHideSuppressed<T>(callback: () => PromiseLike<T>, releaseDelayMs?: number): Promise<T>
+  public withBlurHideSuppressed<T>(callback: () => T, releaseDelayMs?: number): T
+  public withBlurHideSuppressed<T>(
+    callback: () => T | PromiseLike<T>,
+    releaseDelayMs: number = 500
+  ): T | Promise<T> {
+    this.beginModalDialogBlurHideSuppression()
     try {
-      return callback()
-    } finally {
-      this.modalDialogBlurHideReleaseTimer = setTimeout(() => {
-        this.modalDialogBlurHideSuppressed = false
-        this.modalDialogBlurHideReleaseTimer = null
-      }, releaseDelayMs)
+      const result = callback()
+      if (this.isPromiseLike(result)) {
+        return Promise.resolve(result).finally(() => {
+          this.endModalDialogBlurHideSuppression(releaseDelayMs)
+        })
+      }
+
+      this.endModalDialogBlurHideSuppression(releaseDelayMs)
+      return result
+    } catch (error) {
+      this.endModalDialogBlurHideSuppression(releaseDelayMs)
+      throw error
     }
   }
 
