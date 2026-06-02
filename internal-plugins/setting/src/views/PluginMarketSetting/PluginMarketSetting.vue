@@ -12,6 +12,7 @@ import { PluginDetail, PluginCard, CategoryCard, CategoryDetail, RefreshButton }
 import type { Plugin, CategoryInfo, CategoryLayoutSection, PluginDownloadState } from './components'
 import { useJumpFunction, useZtoolsSubInput } from '@/composables'
 import { PluginMarketSettingJumpFunction } from '@/views/PluginMarketSetting/PluginMarketSetting'
+import { getMarketCategoryIcon, marketBannerImage } from './marketAssets'
 
 const { success, error, confirm } = useToast()
 
@@ -172,7 +173,7 @@ async function fetchPlugins(): Promise<void> {
               key: cat.key,
               title: cat.title,
               description: cat.description,
-              icon: cat.icon,
+              icon: getMarketCategoryIcon(cat.key),
               plugins: categoryPlugins
             }
           }
@@ -187,6 +188,26 @@ async function fetchPlugins(): Promise<void> {
         // 处理 sections：将 fixed/random 中的插件替换为带安装状态的版本
         storefrontSections.value = typedMarketResult.storefront.sections
           .map((section) => {
+            if (section.type === 'banner') {
+              return {
+                ...section,
+                items: section.items?.map((item) => ({
+                  ...item,
+                  image: marketBannerImage
+                }))
+              }
+            }
+
+            if (section.type === 'navigation' && Array.isArray(section.categories)) {
+              return {
+                ...section,
+                categories: section.categories.map((cat) => ({
+                  ...cat,
+                  icon: getMarketCategoryIcon(cat.key)
+                }))
+              }
+            }
+
             if (
               (section.type === 'fixed' || section.type === 'random') &&
               Array.isArray(section.plugins)
