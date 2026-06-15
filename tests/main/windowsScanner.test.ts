@@ -1,4 +1,11 @@
 import { describe, it, expect, vi } from 'vitest'
+
+// mock 原生模块：避免 vite import-analysis 解析 native/index.ts 中的 .node?asset 导入
+// （windowsScanner 仅类型上依赖 MuiResolver，本文件的纯函数 / parseUrlFile 测试不触发它）
+vi.mock('../../src/main/core/native/index', () => ({
+  MuiResolver: { resolve: vi.fn(() => new Map()) }
+}))
+
 import {
   shouldSkipShortcut,
   getIconUrl,
@@ -93,6 +100,25 @@ describe('deduplicateCommands', () => {
     expect(result[0].name).toBe('App')
     // 保留第一个出现的 .lnk 路径
     expect(result[0].path).toBe('C:\\Users\\test\\Start Menu\\Programs\\App.lnk')
+  })
+
+  it('应合并 Start Menu 根级与 Programs 子树同名同目标的快捷方式', () => {
+    // issue #551 场景：根级 .lnk 与 Programs 子树 .lnk 同名同目标，应合并为单一指令
+    const apps = [
+      {
+        name: 'App',
+        path: 'C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\App.lnk',
+        _dedupeTarget: 'C:\\Program Files\\App\\app.exe'
+      },
+      {
+        name: 'App',
+        path: 'C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\App.lnk',
+        _dedupeTarget: 'C:\\Program Files\\App\\app.exe'
+      }
+    ]
+    const result = deduplicateCommands(apps)
+    expect(result).toHaveLength(1)
+    expect(result[0].name).toBe('App')
   })
 
   it('应保留不同名但同目标的应用（核心特性）', () => {

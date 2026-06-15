@@ -3,7 +3,11 @@ import { BrowserWindow } from 'electron'
 import fs from 'fs'
 import path from 'path'
 import appsAPI from './api/renderer/commands'
-import { getMacApplicationPaths, getWindowsScanPaths } from './utils/systemPaths'
+import {
+  getMacApplicationPaths,
+  getWindowsRootScanPaths,
+  getWindowsScanPaths
+} from './utils/systemPaths'
 
 // 要跳过的文件夹名称
 const SKIP_FOLDERS = [
@@ -20,7 +24,10 @@ const SKIP_FOLDERS = [
 ]
 
 class AppWatcher {
-  private watcher: FSWatcher | null = null
+  // 递归 watcher：覆盖 Programs 子树 + 桌面（Windows depth:5）/ macOS .app 目录
+  private recursiveWatcher: FSWatcher | null = null
+  // 扁平根 watcher：覆盖 Start Menu 根级直接文件（Windows depth:0），与 scanDirectoryFlat 扫描范围对齐
+  private flatRootWatcher: FSWatcher | null = null
   private mainWindow: BrowserWindow | null = null
   private debounceTimer: NodeJS.Timeout | null = null
   private readonly DEBOUNCE_DELAY = 1000 // 1秒防抖
@@ -31,8 +38,8 @@ class AppWatcher {
     this.startWatching()
   }
 
-  // 获取监听路径
-  private getWatchPaths(): string[] {
+  // 获取递归监听路径（Programs 子树 + 桌面 / macOS 应用目录）
+  private getRecursiveWatchPaths(): string[] {
     if (process.platform === 'win32') {
       return getWindowsScanPaths()
     }
@@ -44,7 +51,20 @@ class AppWatcher {
     return []
   }
 
-  // 判断是否应该忽略
+  // 获取扁平根监听路径（仅 Windows：Start Menu 根，不下钻 Programs）
+  private getFlatRootWatchPaths(): string[] {
+    if (process.platform === 'win32') {
+      return getWindowsRootScanPaths()
+    }
+
+    return []
+  }
+
+  // 判断是否应该忽略。
+  // 该规则被递归 watcher 与扁平根 watcher 复用（各自传入对应的 watchPaths）：
+  // - 递归 watcher：放行根/子目录（供下钻）与 .lnk
+  // - 扁平根 watcher：放行 Start Menu 根与根级 .lnk；depth:0 已在 chokidar 层阻止下钻，
+  //   且 Windows 仅监听 .lnk 的 add/unlink（不监听 addDir），故放行目录条目不产生多余刷新
   private shouldIgnore(filePath: string, watchPaths: string[]): boolean {
     const basename = path.basename(filePath)
 
@@ -97,29 +117,44 @@ class AppWatcher {
 
   // 启动监听
   private startWatching(): void {
-    // 根据平台设置监听目录
-    const watchPaths = this.getWatchPaths()
-
-    console.log('[AppWatcher] 开始监听应用目录变化:', watchPaths)
-
+    const recursivePaths = this.getRecursiveWatchPaths()
+    const flatRootPaths = this.getFlatRootWatchPaths()
     const isWindows = process.platform === 'win32'
 
-    // 创建监听器
-    this.watcher = chokidar.watch(watchPaths, {
-      // Windows 需要递归监听子目录，macOS 只需要一级
-      depth: isWindows ? 5 : 1,
-      // 根据平台设置忽略规则
+    console.log('[AppWatcher] 开始监听应用目录变化(递归):', recursivePaths)
+    console.log('[AppWatcher] 开始监听应用目录变化(扁平根):', flatRootPaths)
+
+    // 递归 watcher（行为不变）：Windows depth:5 覆盖 Programs 子树与桌面
+    this.recursiveWatcher = this.createWatcher(recursivePaths, isWindows ? 5 : 1, isWindows)
+
+    // 扁平根 watcher：Windows 对 Start Menu 根以 depth:0 监听，仅根级直接文件，不下钻 Programs
+    // 监听范围 MUST 等于扫描范围（scanDirectoryFlat 同样扁平），故不靠与 Programs 的去重来避免重复
+    if (flatRootPaths.length > 0) {
+      this.flatRootWatcher = this.createWatcher(flatRootPaths, 0, isWindows)
+    }
+
+    this.bindWatcherEvents(this.recursiveWatcher)
+    if (this.flatRootWatcher) {
+      this.bindWatcherEvents(this.flatRootWatcher)
+    }
+  }
+
+  // 创建 chokidar watcher（两个 watcher 共用相同的选项骨架，仅 depth / paths 不同）
+  private createWatcher(paths: string[], depth: number, usePolling: boolean): FSWatcher {
+    return chokidar.watch(paths, {
+      depth,
+      // 根据平台设置忽略规则（传入该 watcher 自己的 watchPaths）
       ignored: (filePath: string) => {
-        return this.shouldIgnore(filePath, watchPaths)
+        return this.shouldIgnore(filePath, paths)
       },
       // 持久化监听
       persistent: true,
       // 忽略初始添加事件(避免启动时触发大量事件)
       ignoreInitial: true,
       // Windows 使用轮询避免 fs.watch 占用文件夹句柄导致无法重命名/删除
-      usePolling: isWindows,
-      interval: isWindows ? 5000 : undefined,
-      binaryInterval: isWindows ? 5000 : undefined,
+      usePolling,
+      interval: usePolling ? 5000 : undefined,
+      binaryInterval: usePolling ? 5000 : undefined,
       // 监听文件夹事件
       followSymlinks: false,
       // 避免在 macOS 上出现问题
@@ -128,11 +163,14 @@ class AppWatcher {
         pollInterval: 100
       }
     })
+  }
 
+  // 绑定 add / unlink / error / ready 事件（两个 watcher 共用同一套处理 + 防抖 notifyChange）
+  private bindWatcherEvents(watcher: FSWatcher): void {
     // 监听添加事件
     if (process.platform === 'win32') {
       // Windows: 监听 .lnk 文件
-      this.watcher.on('add', (filePath: string) => {
+      watcher.on('add', (filePath: string) => {
         if (filePath.endsWith('.lnk')) {
           console.log('[AppWatcher] 检测到新快捷方式:', filePath)
           this.notifyChange('add', filePath)
@@ -142,7 +180,7 @@ class AppWatcher {
 
     if (process.platform === 'darwin') {
       // macOS: 监听 .app 目录
-      this.watcher.on('addDir', (filePath: string) => {
+      watcher.on('addDir', (filePath: string) => {
         if (filePath.endsWith('.app')) {
           console.log('[AppWatcher] 检测到新应用:', filePath)
           this.notifyChange('add', filePath)
@@ -153,7 +191,7 @@ class AppWatcher {
     // 监听删除事件
     if (process.platform === 'win32') {
       // Windows: 监听 .lnk 文件删除
-      this.watcher.on('unlink', (filePath: string) => {
+      watcher.on('unlink', (filePath: string) => {
         if (filePath.endsWith('.lnk')) {
           console.log('[AppWatcher] 检测到快捷方式删除:', filePath)
           this.notifyChange('remove', filePath)
@@ -163,7 +201,7 @@ class AppWatcher {
 
     if (process.platform === 'darwin') {
       // macOS: 监听 .app 目录删除
-      this.watcher.on('unlinkDir', (filePath: string) => {
+      watcher.on('unlinkDir', (filePath: string) => {
         if (filePath.endsWith('.app')) {
           console.log('[AppWatcher] 检测到应用删除:', filePath)
           this.notifyChange('remove', filePath)
@@ -172,12 +210,12 @@ class AppWatcher {
     }
 
     // 监听错误
-    this.watcher.on('error', (error: unknown) => {
+    watcher.on('error', (error: unknown) => {
       console.error('[AppWatcher] 应用目录监听错误:', error)
     })
 
     // 监听准备完成
-    this.watcher.on('ready', () => {
+    watcher.on('ready', () => {
       console.log('[AppWatcher] 应用目录监听器已就绪')
     })
   }
@@ -202,11 +240,16 @@ class AppWatcher {
 
   // 停止监听
   public stop(): void {
-    if (this.watcher) {
-      console.log('[AppWatcher] 停止监听应用目录')
-      this.watcher.close()
-      this.watcher = null
+    // 同时关闭递归 watcher 与扁平根 watcher
+    const watchers = [this.recursiveWatcher, this.flatRootWatcher]
+    for (const watcher of watchers) {
+      if (watcher) {
+        console.log('[AppWatcher] 停止监听应用目录')
+        watcher.close()
+      }
     }
+    this.recursiveWatcher = null
+    this.flatRootWatcher = null
 
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer)
